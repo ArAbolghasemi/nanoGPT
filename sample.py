@@ -6,18 +6,23 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
+import numpy as np
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
-start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+data_type = 'text' # or 'numpy_array' for the moSeq dataset
+start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt" or a numpy array "FILE:prompt.npy"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
 temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
 seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
+sample_file_name = 'samples' # where to save the samples
+print_samples = False # print the samples to the console
+save_samples = True # save the samples to a file
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -64,8 +69,16 @@ if load_meta:
         meta = pickle.load(f)
     # TODO want to make this more general to arbitrary encoder/decoder schemes
     stoi, itos = meta['stoi'], meta['itos']
-    encode = lambda s: [stoi[c] for c in s]
-    decode = lambda l: ''.join([itos[i] for i in l])
+    if data_type == 'text':
+        encode = lambda s: [stoi[c] for c in s]
+        decode = lambda l: ''.join([itos[i] for i in l])
+    elif data_type == 'numpy_array':
+        encode = lambda s: [stoi[c] for c in s]
+        decode = lambda l: np.array([itos[i] for i in l])
+    else:
+        # TODO: you really need abstract this and make it more general - i.e., make it independent of the 
+        # data_type and to the encoder/decoder then transter it the the data_type
+        raise ValueError(f"Unknown data_type: {data_type}")
 else:
     # ok let's assume gpt-2 encodings by default
     print("No meta.pkl found, assuming GPT-2 encodings...")
@@ -73,17 +86,47 @@ else:
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
 
-# encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
-start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+# if the data is a natrual language text, we so the data is a string 
+if data_type == 'text':
+    # encode the beginning of the prompt
+    if start.startswith('FILE:'):
+        with open(start[5:], 'r', encoding='utf-8') as f:
+            start = f.read()
+    start_ids = encode(start)
+    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
-# run generation
+elif data_type == 'numpy_array':
+    if start.startswith('FILE:'):
+        start = np.load(start[5:], allow_pickle=True)
+    else:
+        start = decode([1])
+    start_ids = encode(start)
+    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+else:
+    raise ValueError(f"Unknown data_type: {data_type}")
+    # run generation
+
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
-            print('---------------')
+            if print_samples:
+                print(decode(y[0].tolist()))
+                print('---------------')
+            if save_samples:
+                if data_type == 'text':
+                    # save the samples to a text file
+                    file_name = f"{sample_file_name}_{k}.txt"
+                    file_path = os.path.join(out_dir, file_name)
+                    # rewrite the file if it already exists
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write(decode(y[0].tolist()))
+                elif data_type == 'numpy_array':
+                    # save the samples to a numpy file
+                    file_name = f"{sample_file_name}_{k}.npy"
+                    file_path = os.path.join(out_dir, file_name)
+                    # rewrite the file if it already exists
+                    decoded_sample = decode(y[0].cpu().numpy())
+                    np.save(file_path, decoded_sample)
+                else:
+                    raise ValueError(f"Unknown data_type: {data_type}")
