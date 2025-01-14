@@ -34,19 +34,30 @@ def print_model_layers(model):
     for idx, layer in enumerate(model.transformer.h):
         print(f"Layer {idx}: {layer}")
 
-def get_layer_activations(model, layer_idx, input_tensor, submodule='final', device='cuda'):
+def get_layer_activations(model, layer_idx, input_tensor, submodule='final', device='cuda', max_bach_size=50):
     """
     Get activations of a specific part of a layer for given inputs.
     Args:
         model (torch.nn.Module): Loaded GPT model.
         layer_idx (int): Index of the desired layer (0-based indexing).
-        input_tensor (torch.Tensor): Input tensor of shape (B, block_size).
+        input_tensor (torch.Tensor): Input tensor of shape (B, block_size), B = batch size, block_size = sequence length.
         submodule (str): Specify which part of the layer to capture ('ln_1', 'attn', 'residual_1',
                          'ln_2', 'mlp', 'residual_2', 'final').
         device (str): Device for computation.
     Returns:
         activations (torch.Tensor): Activations of the specified submodule or final output.
     """
+
+    # if the data size is too large, we can split it into smaller batches 
+    if input_tensor.size(0) > max_bach_size:
+        input_tensor_list = torch.chunk(input_tensor, max_bach_size, dim=0)
+        activations_list = []
+        for input_tensor in input_tensor_list:
+            activations = get_layer_activations(model, layer_idx, input_tensor, submodule, device)
+            activations_list.append(activations)
+        activations = torch.cat(activations_list, dim=0)
+        return activations
+
     activations = None
 
     # Hook to capture activations
@@ -89,8 +100,14 @@ def get_layer_activations(model, layer_idx, input_tensor, submodule='final', dev
 
     # Remove the hook after forward pass
     handle.remove()
+    # let clone the activations to avoid memory leak
+    activations_cloneed = activations.clone().detach()
+    # let clear the activations to avoid memory leak 
+    activations = None
+    # let clear all left over memory
+    torch.cuda.empty_cache()
 
-    return activations
+    return activations_cloneed
 
 # Example usage
 if __name__ == "__main__":
