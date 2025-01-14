@@ -188,7 +188,7 @@ def optimize_single_unit_with_tv(model, layer_id, channel_id,
 
     return history, score_hist
 
-def optimize_single_unit_debug(model, layer_id, channel_id, 
+def optimize_single_unit_debug(model, layer_id, channel_id, #TODO: Make this work; USE wraping instead of clamp!!
                                  lr=1e-2, weight_decay=0e-4, max_iter=500, opt_type="all",
                                  block_size=1024, vocab_size=50304, device='cuda', print_progress=True):
     """
@@ -270,7 +270,7 @@ def optimize_single_unit_debug(model, layer_id, channel_id,
 
     return history, score_hist
 
-def optimize_single_unit_CholeskyCMAES(
+def optimize_single_unit_CholeskyCMAES( #TODO: Make desision wheter to use calamp or wraping!
     model, layer_id, channel_id, max_iter=100, opt_type="all",
     block_size=1024, vocab_size=50304, device='cuda', print_progress=True,
     init_sigma=3.0, Aupdate_freq=10, maximize=True, random_seed=None, optim_params={},
@@ -310,17 +310,17 @@ def optimize_single_unit_CholeskyCMAES(
     model.eval()
 
     # Initialize input tensor (you can also use random initialization if needed) if not provided
-    if init_code is not None:
+    if init_code is None:
         if init_code_type == 'zeros':
-            input_tensor = torch.zero((1, block_size), dtype=torch.long, device=device)
+            input_tensor = torch.zeros((1, block_size), dtype=torch.long, device=device)
         elif init_code_type == 'random':
             input_tensor = torch.randint(0, vocab_size, (1, block_size), device=device, dtype=torch.long)
         else:
             raise ValueError(f"Invalid init_code_type: {init_code_type}") 
 
     # Tensor to store input history across iterations
-    opt_hist = torch.zeros((max_iter, 30, block_size), dtype=torch.long, device=device)
-    score_hist = torch.zeros((max_iter, 30), dtype=torch.float32, device=device)
+    opt_hist = torch.zeros((max_iter, 30, block_size), dtype=torch.long)
+    score_hist = torch.zeros((max_iter, 30), dtype=torch.float32)
 
     # Initialize the optimizer with CMA-ES
     new_codes = torch.zeros([1, block_size], dtype=torch.long)
@@ -370,11 +370,18 @@ def optimize_single_unit_CholeskyCMAES(
         new_codes = optimizer.step_simple(score, new_codes)
 
         # Update the input tensor and history
-        input_tensor = new_codes.clone().detach().long()
-        input_tensor.clamp_(0, vocab_size - 1)  # Clamp values to valid range
+        cloned_codes = new_codes.clone().detach().long()
+        
+        # new_teinput_tensornsor = cloned_codes
+        # input_tensor.clamp_(0, vocab_size - 1)  # Clamp values to valid range # it's a fix clamp which mean it will just trim i
+        
+        # Apply circular wrapping (modulo operation) to wrap values within the valid range
+        input_tensor = cloned_codes % vocab_size  # Wrap values within [0, vocab_size-1]
 
-        opt_hist[i, 0: input_tensor.shape[0], 0: input_tensor.shape[1]] = input_tensor.clone()
-        score_hist[i, 0: score.shape[0]] = score.clone()
+        score_cloned = score.clone()
+        input_tensor_cloned = input_tensor.clone()
+        opt_hist[i, 0: input_tensor.shape[0], 0: input_tensor.shape[1]] = input_tensor_cloned.detach()
+        score_hist[i, 0: score.shape[0]] = score_cloned.detach()
 
         # Debug: Print progress
         if print_progress:
@@ -382,6 +389,10 @@ def optimize_single_unit_CholeskyCMAES(
 
     # Remove the hook after optimization
     hook.remove()
+    # let clean up all the strage on the GPU before leveing
+    activations = None
+    new_codes = None
+    torch.cuda.empty_cache()
 
     return opt_hist, score_hist
 
@@ -462,13 +473,14 @@ if __name__ == "__main__":
         block_size=block_size,
         device=device,
         opt_type="last",
-        max_iter = 5000,
+        max_iter = 100,
         print_progress=True,
-        init_sigma=15.0, 
+        init_sigma=5.0, 
         Aupdate_freq=10, 
         maximize=True, 
         random_seed=None,
-        penalty_weight=1, 
+        penalty_weight=.25, 
+        init_code_type='zeros'
     )
     
     # let print the first the optimized input
@@ -478,7 +490,7 @@ if __name__ == "__main__":
     # let plot the score history 
     import matplotlib.pyplot as plt
     #import time
-    score_mean = torch.mean(score_hist, dim=-1).cpu().numpy()
+    score_mean = torch.mean(score_hist, dim=-1).numpy()
     plt.plot(score_mean[2:])
     plt.xlabel("Iteration")
     plt.ylabel("Score")
