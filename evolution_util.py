@@ -159,11 +159,10 @@ def optimize_single_unit_with_tv(model, layer_id, channel_id,
             activation_loss = -activations[:, -1, channel_id]
 
         # TV regularization term
-        #tv_loss = tv_weight * torch.sum(torch.abs(float_input[:, 1:] - float_input[:, :-1]))
+        tv_loss = tv_weight * torch.sum(torch.abs(float_input[:, 1:] - float_input[:, :-1]))
 
         # Total loss
-        #loss = activation_loss + tv_loss
-        loss = activation_loss
+        loss = activation_loss + tv_loss
         loss.backward()
 
         # Step the optimizer
@@ -189,8 +188,7 @@ def optimize_single_unit_with_tv(model, layer_id, channel_id,
 
     return history, score_hist
 
-
-def optimize_single_unit_with_tv_debug(model, layer_id, channel_id, 
+def optimize_single_unit_debug(model, layer_id, channel_id, 
                                  lr=1e-2, weight_decay=0e-4, max_iter=500, opt_type="all",
                                  block_size=1024, vocab_size=50304, device='cuda', print_progress=True):
     """
@@ -272,13 +270,14 @@ def optimize_single_unit_with_tv_debug(model, layer_id, channel_id,
 
     return history, score_hist
 
-
 def optimize_single_unit_CholeskyCMAES(
-    model, layer_id, channel_id, max_iter=100, opt_type = "all",
+    model, layer_id, channel_id, max_iter=100, opt_type="all",
     block_size=1024, vocab_size=50304, device='cuda', print_progress=True,
-    init_sigma=3.0, Aupdate_freq=10, maximize=True, random_seed=None, optim_params={}):
+    init_sigma=3.0, Aupdate_freq=10, maximize=True, random_seed=None, optim_params={},
+    penalty_weight=1e-2, penalty_type="syll_change", init_code=None, init_code_type = 'zeros'
+    ):
     """
-    Optimize the input to maximize the activation of a single unit in the model using CholeskyCMAES.
+    Optimize the input to maximize the activation of a single unit in the model using CholeskyCMAES with TV normalization.
 
     Args:
         model (torch.nn.Module): Loaded GPT model.
@@ -294,24 +293,37 @@ def optimize_single_unit_CholeskyCMAES(
         maximize (bool): Whether to maximize or minimize the score.
         random_seed (int): Seed for random number generation.
         optim_params (dict): Additional parameters for the optimizer.
+        tv_weight (float): Weight for Total Variation (TV) normalization.
+        penalty_weight (float): Weight for the penalty term.
+        penalty_type (str): Type of penalty term ('syll_change' or None).
+        init_code (torch.Tensor): Initial input tensor for optimization.
+        init_code_type (str): Type of initialization ('zeros' or 'random').
 
     Returns:
         opt_hist (torch.Tensor): History of optimized inputs across iterations.
-                                 Shape: (max_iter, 1, block_size).
+                                 Shape: (max_iter, population_size, block_size).
+        score_hist (torch.Tensor): History of scores across iterations.
+                                   Shape: (max_iter, population_size).
     """
     # Move the model to the specified device and set it to evaluation mode
     model.to(device)
     model.eval()
 
-    # Initialize input tensor (you can also use random initialization if needed)
-    input_tensor = torch.zeros((1, block_size), dtype=torch.long, device=device)
+    # Initialize input tensor (you can also use random initialization if needed) if not provided
+    if init_code is not None:
+        if init_code_type == 'zeros':
+            input_tensor = torch.zero((1, block_size), dtype=torch.long, device=device)
+        elif init_code_type == 'random':
+            input_tensor = torch.randint(0, vocab_size, (1, block_size), device=device, dtype=torch.long)
+        else:
+            raise ValueError(f"Invalid init_code_type: {init_code_type}") 
 
     # Tensor to store input history across iterations
     opt_hist = torch.zeros((max_iter, 30, block_size), dtype=torch.long, device=device)
     score_hist = torch.zeros((max_iter, 30), dtype=torch.float32, device=device)
 
     # Initialize the optimizer with CMA-ES
-    new_codes = torch.zeros([1, block_size], dtype=torch.long)  # Initial codes
+    new_codes = torch.zeros([1, block_size], dtype=torch.long)
 
     optimizer = CholeskyCMAES_torch(
         block_size, population_size=None, init_sigma=init_sigma,
@@ -331,49 +343,47 @@ def optimize_single_unit_CholeskyCMAES(
 
     # Optimization loop
     pbar = trange(max_iter) if print_progress else range(max_iter)
-    print("input_tensor shape:", input_tensor.shape)
     for i in pbar:
-
         # Ensure input_tensor is on the correct device
         input_tensor = input_tensor.to(device)
 
-        # Compute the score for the current codes
+        # Perform forward pass and compute the score
         with torch.no_grad():
-            _ = model(input_tensor)  # Perform forward pass
+            _ = model(input_tensor)
             if opt_type == "all":
-                score = activations[:, :, channel_id].mean(dim=-1) # Compute the score
-            elif opt_type == "last":    
-                score = activations[:, -1, channel_id] # Compute the score
+                score_act = activations[:, :, channel_id].mean(dim=-1)
+            elif opt_type == "last":
+                score_act = activations[:, -1, channel_id]
             else:
                 raise ValueError(f"Invalid opt_type: {opt_type}")
 
-        #print("score shape:", score.shape)
-        #print("score:", score)
+        # Apply normalization pemalty
+        score = score_act
+        penalty = 0
+        if penalty_type is not None:
+            if penalty_type == "syll_change":
+                # Penalize for syllable changes in the input -> idea is to prevent rapid changes
+                penalty = penalty_weight*torch.sum((input_tensor[:, 1:] != input_tensor[:, :-1]).float(), dim=-1)
+                score = score_act - penalty
 
         # Update the codes using the optimizer and the score
-        #print("new_codes shape:", new_codes.shape)
-        #print("new_codes:", new_codes)
         new_codes = optimizer.step_simple(score, new_codes)
 
         # Update the input tensor and history
-        input_tensor = new_codes.clone().detach().long()  # Update input as integer tensor
-        # inf any value is out of range, clamp it to the valid range
+        input_tensor = new_codes.clone().detach().long()
         input_tensor.clamp_(0, vocab_size - 1)  # Clamp values to valid range
-        #print("input_tensor shape:", input_tensor.shape)
-        #print("input_tensor:", input_tensor)
-        
+
         opt_hist[i, 0: input_tensor.shape[0], 0: input_tensor.shape[1]] = input_tensor.clone()
         score_hist[i, 0: score.shape[0]] = score.clone()
 
         # Debug: Print progress
         if print_progress:
-            pbar.set_description(f"Iter {i+1}/{max_iter}, Score mean: {score.mean().item():.4f}")
+            pbar.set_description(f"Iter {i+1}/{max_iter}, act = {score_act.mean().item():.4f}, Score mean: {score.mean().item():.4f},  penalty: {penalty.mean().item():.4f}")
 
     # Remove the hook after optimization
     hook.remove()
 
     return opt_hist, score_hist
-
 
 
 if __name__ == "__main__":
@@ -412,7 +422,7 @@ if __name__ == "__main__":
 
      # Parameters
     layer_id = 5      # Layer index
-    channel_id = 3    # Channel index
+    channel_id = 10    # Channel index
 
     # Optimize the unit
     """optimized_input = optimize_single_unit_1(
@@ -428,21 +438,7 @@ if __name__ == "__main__":
         print_progress=True
     )
 
-    optimized_input, score_hist = optimize_single_unit_CholeskyCMAES(
-        model=model,
-        layer_id=layer_id,
-        channel_id=channel_id,
-        vocab_size=vocab_size,
-        block_size=block_size,
-        device=device,
-        opt_type="last",
-        max_iter = 300,
-        print_progress=True,
-        init_sigma=3.0, 
-        Aupdate_freq=10, 
-        maximize=True, 
-        random_seed=None, 
-    )"""
+    
 
     optimized_input, score_hist = optimize_single_unit_with_tv_debug(
         model=model,
@@ -456,21 +452,42 @@ if __name__ == "__main__":
         print_progress=True,
         lr=1e-2, 
         weight_decay=0e-4, 
+    )"""
+
+    optimized_input, score_hist = optimize_single_unit_CholeskyCMAES(
+        model=model,
+        layer_id=layer_id,
+        channel_id=channel_id,
+        vocab_size=vocab_size,
+        block_size=block_size,
+        device=device,
+        opt_type="last",
+        max_iter = 5000,
+        print_progress=True,
+        init_sigma=15.0, 
+        Aupdate_freq=10, 
+        maximize=True, 
+        random_seed=None,
+        penalty_weight=1, 
     )
-
-
-    """
+    
     # let print the first the optimized input
     print(" optimized input shape:", optimized_input.shape)
-    print(" optimized input:", optimized_input[-1, :, :])
+    print(" optimized input:", optimized_input[-1, 0, :])
+    print(" optimized input example:", optimized_input[-1, :, :])
     # let plot the score history 
     import matplotlib.pyplot as plt
+    #import time
     score_mean = torch.mean(score_hist, dim=-1).cpu().numpy()
-    plt.plot(score_mean)
+    plt.plot(score_mean[2:])
     plt.xlabel("Iteration")
     plt.ylabel("Score")
     plt.title("Score History")
-    plt.show()"""
+    plt.show()
+    # wait for 5 seconds and then close the plot
+    #time.sleep(5)
+    #plt.close()
+    # let print the last optimized input
 
 
     
