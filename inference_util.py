@@ -91,18 +91,20 @@ def get_layer_activations(model, layer_idx, input_tensor, submodule='final', dev
     handle.remove()
 
     return activations
-"""
+
 # Example usage
 if __name__ == "__main__":
     # Parameters
     checkpoint_path = "out-moSeq-syll_e1"
-    layer_index = 0  # Example: Get activations from the 4th layer
-    B, block_size = 8, 256  # Batch size and sequence length
-    vocab_size = 30  # Example GPT vocab size
-
+    layer_index = 5  # Example: Get activations from the 4th layer
+    B = 8
     # Load the model
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model, model_config = load_model_from_checkpoint(checkpoint_path, device)
+
+    block_size = model.config.block_size
+    vocab_size = model.config.vocab_size
+    print(f"Block size: {block_size}, Vocab size: {vocab_size}")
 
     # Print model layers
     print_model_layers(model)
@@ -149,4 +151,3 @@ if __name__ == "__main__":
     # Get final layer output
     final_activations = get_layer_activations(model, layer_index, input_tensor, submodule='final', device=device)
     print(f"Final Layer Activations shape: {final_activations.shape}")
-"""
